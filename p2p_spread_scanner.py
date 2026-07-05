@@ -1,5 +1,5 @@
 import os
-import json
+import statistics
 import requests
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -7,18 +7,21 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 ASSET = "USDT"
 FIAT = "RUB"
-MIN_SPREAD_PCT = 1.5
+MIN_SPREAD_PCT = 1.0        # порог алерта (можно менять)
 NETWORK_FEE_USDT = 1.0
 TRADE_AMOUNT_RUB = 100000
-
-DEBUG_MEXC = True  # печатать сырой ответ MEXC в лог (для настройки)
-
-ENABLED = {
-    "bybit": True,
-    "mexc":  True,
-}
+OUTLIER_PCT = 3.0           # отбрасывать цены дальше 3% от медианы
 
 HEADERS = {"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}
+
+
+def clean(prices):
+    """Убирает фантомные цены — всё, что дальше OUTLIER_PCT от медианы."""
+    prices = [p for p in prices if p and p > 0]
+    if len(prices) < 3:
+        return prices
+    med = statistics.median(prices)
+    return [p for p in prices if abs(p - med) / med * 100 <= OUTLIER_PCT]
 
 
 def fetch_bybit():
@@ -26,110 +29,91 @@ def fetch_bybit():
 
     def query(side):
         payload = {"tokenId": ASSET, "currencyId": FIAT, "side": side,
-                   "size": "10", "page": "1", "payment": []}
+                   "size": "20", "page": "1", "payment": []}
         r = requests.post(url, json=payload, headers=HEADERS, timeout=15)
         items = r.json()["result"]["items"]
         return [float(i["price"]) for i in items if i.get("price")]
 
-    asks = query("1")
-    bids = query("0")
+    asks = clean(query("1"))   # где вы покупаете
+    bids = clean(query("0"))   # где вы продаёте
     if not asks or not bids:
         return None
     return min(asks), max(bids)
 
 
-def fetch_mexc():
-    # tradeType: BUY = вы покупаете USDT, SELL = вы продаёте
-    url = "https://p2p.mexc.com/api/market/otc/ads/list"
+def fetch_binance():
+    url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
 
     def query(trade_type):
-        params = {
-            "currency": ASSET, "fiat": FIAT, "tradeType": trade_type,
-            "page": "1", "pageSize": "10",
-        }
-        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        data = r.json()
-        if DEBUG_MEXC:
-            print(f"=== MEXC raw ({trade_type}) ===")
-            print(json.dumps(data, ensure_ascii=False)[:1500])
-        # структуру уточним по выводу; пробуем типовой путь
-        items = data.get("data", []) or []
-        prices = []
-        for it in items:
-            p = it.get("price") or it.get("adv", {}).get("price")
-            if p:
-                prices.append(float(p))
-        return prices
+        payload = {"asset": ASSET, "fiat": FIAT, "tradeType": trade_type,
+                   "page": 1, "rows": 20, "payTypes": [],
+                   "publisherType": None}
+        r = requests.post(url, json=payload, headers=HEADERS, timeout=15)
+        rows = r.json().get("data", [])
+        return [float(x["adv"]["price"]) for x in rows if x.get("adv", {}).get("price")]
 
-    asks = query("BUY")
-    bids = query("SELL")
+    asks = clean(query("BUY"))
+    bids = clean(query("SELL"))
     if not asks or not bids:
         return None
     return min(asks), max(bids)
 
 
-FETCHERS = {"bybit": fetch_bybit, "mexc": fetch_mexc}
+FETCHERS = {"bybit": fetch_bybit, "binance": fetch_binance}
 
 
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Нет секретов Telegram.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                                 "parse_mode": "HTML"}, timeout=15)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=15)
     except Exception as e:
         print("Telegram error:", e)
 
 
-def collect_quotes():
+def main():
     quotes = {}
-    for name, on in ENABLED.items():
-        if not on:
-            continue
+    for name, fn in FETCHERS.items():
         try:
-            res = FETCHERS[name]()
+            res = fn()
             if res:
                 quotes[name] = {"buy": res[0], "sell": res[1]}
-                print(f"[{name}] buy={res[0]} sell={res[1]}")
+                print(f"[{name}] buy={res[0]:.2f} sell={res[1]:.2f}")
             else:
                 print(f"[{name}] нет данных")
         except Exception as e:
             print(f"[{name}] ошибка: {e}")
-    return quotes
 
-
-def find_best_spread(quotes):
-    if len(quotes) < 1:
-        return None
-    buy_ex = min(quotes, key=lambda x: quotes[x]["buy"])
-    sell_ex = max(quotes, key=lambda x: quotes[x]["sell"])
-    if buy_ex == sell_ex and len(quotes) > 1:
-        return None
-    bp = quotes[buy_ex]["buy"]
-    sp = quotes[sell_ex]["sell"]
-    usdt = TRADE_AMOUNT_RUB / bp
-    profit = (usdt - NETWORK_FEE_USDT) * sp - TRADE_AMOUNT_RUB
-    return {"buy_ex": buy_ex, "buy_price": bp, "sell_ex": sell_ex,
-            "sell_price": sp, "spread_pct": profit / TRADE_AMOUNT_RUB * 100,
-            "profit_rub": profit}
-
-
-def main():
-    quotes = collect_quotes()
-    best = find_best_spread(quotes)
-    if not best:
-        print("Итог: нет данных для сравнения.")
+    if len(quotes) < 2:
+        print("Недостаточно бирж для сравнения (нужно 2+).")
         return
-    print(f"ЛУЧШЕЕ: {best['buy_ex']} {best['buy_price']:.2f} -> "
-          f"{best['sell_ex']} {best['sell_price']:.2f} | {best['spread_pct']:.2f}%")
-    if best["spread_pct"] >= MIN_SPREAD_PCT:
+
+    best = None
+    for bex in quotes:
+        for sex in quotes:
+            if bex == sex:               # запрет сравнивать биржу саму с собой
+                continue
+            bp = quotes[bex]["buy"]
+            sp = quotes[sex]["sell"]
+            usdt = TRADE_AMOUNT_RUB / bp
+            profit = (usdt - NETWORK_FEE_USDT) * sp - TRADE_AMOUNT_RUB
+            pct = profit / TRADE_AMOUNT_RUB * 100
+            if best is None or pct > best["pct"]:
+                best = {"bex": bex, "bp": bp, "sex": sex, "sp": sp,
+                        "pct": pct, "profit": profit}
+
+    print(f"ЛУЧШЕЕ: {best['bex']} {best['bp']:.2f} -> "
+          f"{best['sex']} {best['sp']:.2f} | {best['pct']:.2f}%")
+    if best["pct"] >= MIN_SPREAD_PCT:
         send_telegram(
-            f"⚡ Спред {best['spread_pct']:.2f}%\n"
-            f"Купить: {best['buy_ex']} по {best['buy_price']:.2f} ₽\n"
-            f"Продать: {best['sell_ex']} по {best['sell_price']:.2f} ₽\n"
-            f"Прибыль на {TRADE_AMOUNT_RUB:,} ₽: ~{best['profit_rub']:,.0f} ₽")
+            f"⚡ Спред {best['pct']:.2f}%\n"
+            f"Купить: {best['bex']} по {best['bp']:.2f} ₽\n"
+            f"Продать: {best['sex']} по {best['sp']:.2f} ₽\n"
+            f"Прибыль на {TRADE_AMOUNT_RUB:,} ₽: ~{best['profit']:,.0f} ₽")
 
 
 if __name__ == "__main__":
